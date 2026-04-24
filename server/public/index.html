@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ESP-AL</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/css/main.css">
+</head>
+<body>
+  <div id="app">
+
+    <header id="header">
+      <div class="hdr-left">
+        <span class="logo">ESP-AL</span>
+        <span class="logo-sep">//</span>
+        <span class="logo-sub">timelapse control</span>
+      </div>
+      <div class="hdr-right">
+        <span id="hdr-cam-label" class="hdr-cam"></span>
+        <button id="btn-refresh" class="btn btn-ghost btn-sm" title="Refresh current section">↺</button>
+      </div>
+    </header>
+
+    <div class="layout">
+
+      <aside id="sidebar">
+        <div class="sb-block">
+          <div class="sb-label">CAMERA</div>
+          <select id="camera-select" class="select w-full"></select>
+        </div>
+
+        <div class="sb-sep"></div>
+
+        <div class="sb-block">
+          <div class="sb-label">VIEW</div>
+          <ul class="nav-list">
+            <li><a class="nav-link" data-section="status">◈&nbsp; Status</a></li>
+            <li><a class="nav-link" data-section="preview">⊙&nbsp; Live Preview</a></li>
+            <li><a class="nav-link" data-section="photos">⊞&nbsp; Photos</a></li>
+            <li><a class="nav-link" data-section="videos">▶&nbsp; Videos</a></li>
+            <li><a class="nav-link" data-section="stitch">⟳&nbsp; Stitch</a></li>
+            <li><a class="nav-link" data-section="settings">✎&nbsp; Settings</a></li>
+          </ul>
+        </div>
+
+        <div class="sb-sep"></div>
+
+        <div class="sb-block">
+          <div class="sb-label">SYSTEM</div>
+          <ul class="nav-list">
+            <li><a class="nav-link" data-section="cameras">⊕&nbsp; Cameras</a></li>
+            <li><a class="nav-link" data-section="storage">◎&nbsp; Storage</a></li>
+          </ul>
+        </div>
+      </aside>
+
+      <main id="main">
+        <div id="section-status"   class="section active"></div>
+        <div id="section-preview"  class="section"></div>
+        <div id="section-photos"   class="section"></div>
+        <div id="section-videos"   class="section"></div>
+        <div id="section-stitch"   class="section"></div>
+        <div id="section-settings" class="section"></div>
+        <div id="section-cameras"  class="section"></div>
+        <div id="section-storage"  class="section"></div>
+      </main>
+
+    </div>
+  </div>
+
+  <!-- Lightbox -->
+  <div id="lightbox">
+    <div id="lb-bg"></div>
+    <div id="lb-wrap">
+      <img id="lb-img" src="" alt="">
+      <button id="lb-close">✕</button>
+    </div>
+  </div>
+
+  <!-- Toast notifications -->
+  <div id="toasts"></div>
+
+  <script src="/js/app.js"></script>
+</body>
+</html>
