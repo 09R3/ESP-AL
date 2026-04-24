@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  esp-al:
+    build: ./server
+    container_name: esp-al
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3070}:3070"
+    volumes:
+      - ${DATA_DIR:-./data}:/app/data
+    environment:
+      - PORT=3070
+      - DATA_DIR=/app/data
+      - NODE_ENV=production
