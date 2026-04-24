@@ -320,7 +320,7 @@ bool uploadPhoto(const char* date, uint32_t seq, const char* filepath) {
   int code = http.POST(buf, len);
   http.end();
 
-  psramFound() ? ps_free(buf) : free(buf);
+  free(buf);
 
   if (code != 200 && code != 201) {
     Serial.printf("[upload] %s → HTTP %d\n", filepath, code);
