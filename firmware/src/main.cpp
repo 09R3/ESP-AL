@@ -359,15 +359,21 @@ void reportStatus(const char* date, int photoCount, bool pushComplete) {
   snprintf(url, sizeof(url), "%s/api/cameras/%s/status", SERVER_URL, CAMERA_ID);
 
   JsonDocument doc;
-  doc["lastPush"] = pushComplete ? (JsonVariant)true : JsonVariant(); // simplified
 
+  // ISO-8601 timestamp for lastPush
   if (pushComplete) {
+    char ts[24];
+    time_t now = time(nullptr);
+    struct tm t;
+    gmtime_r(&now, &t);
+    strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &t);
+    doc["lastPush"] = ts;
+
     doc["pushComplete"]["date"]       = date;
     doc["pushComplete"]["photoCount"] = photoCount;
   }
 
-  uint64_t chipId = ESP.getEfuseMac();
-  doc["chipId"] = chipId;
+  doc["photosToday"] = (int)photoCounter;
 
   String body;
   serializeJson(doc, body);
