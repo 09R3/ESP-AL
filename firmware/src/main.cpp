@@ -1,13 +1,17 @@
 /*
- * ESP-AL Firmware — always-on mode
+ * ESP-AL Firmware — always-on mode, nightly bulk push
  *
- * Stays connected to WiFi. Captures a photo every intervalMinutes,
- * uploads it to the server immediately, and saves a copy to SD as backup.
- * No deep sleep — assumes the board is powered from mains via USB-C.
+ * Stays connected to WiFi. Captures a photo every intervalMinutes and saves
+ * it to SD. At the configured push time (default 02:00 UTC) reads that day's
+ * photos off the SD card and uploads them in sequence, then fires pushComplete
+ * to trigger server-side stitching.
+ *
+ * Preview works any time: dashboard sets previewRequested → firmware sees it
+ * on next config sync, captures a fresh frame, uploads immediately.
  *
  * Boot flow:
  *   setup()  — init camera, SD, WiFi, NTP, fetch config
- *   loop()   — capture on interval, upload, sync config every 30 min
+ *   loop()   — capture on interval, nightly push at pushTime, sync config
  */
 
 #include "Arduino.h"
@@ -19,20 +23,22 @@
 #include "time.h"
 #include "config.h"
 
-// ── Runtime state (no RTC needed — WiFi stays up) ─────────────────────────────
+// ── Runtime state ──────────────────────────────────────────────────────────────
 static int      intervalMin    = DEFAULT_INTERVAL_MIN;
 static bool     captureEnabled = true;
 static bool     previewPending = false;
 static int      cfgFrameSize   = FRAMESIZE_UXGA;
 static int      cfgJpegQuality = 10;
+static int      pushHour       = DEFAULT_PUSH_HOUR;
+static int      pushMin        = DEFAULT_PUSH_MIN;
 
-static char     currentDate[11] = "";
-static uint32_t photoSeq        = 0;
-static uint32_t lastCaptureMs   = 0;
+static char     currentDate[11]  = "";
+static char     lastPushDate[11] = "";   // date of last completed push
+static uint32_t photoSeq         = 0;
+static uint32_t lastCaptureMs    = 0;
 static uint32_t lastConfigSyncMs = 0;
-static uint32_t lastStatusMs    = 0;
-static bool     cameraReady     = false;
-static bool     sdReady         = false;
+static bool     cameraReady      = false;
+static bool     sdReady          = false;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 void getDateStr(char* buf, time_t t = 0) {
@@ -47,6 +53,15 @@ void qualityFromString(const char* q) {
   else if (strcmp(q, "high") == 0)   { cfgFrameSize = FRAMESIZE_SXGA; cfgJpegQuality = 12; }
   else if (strcmp(q, "medium") == 0) { cfgFrameSize = FRAMESIZE_XGA;  cfgJpegQuality = 15; }
   else                               { cfgFrameSize = FRAMESIZE_SVGA; cfgJpegQuality = 20; }
+}
+
+// Returns true if current UTC time is at or past today's push window.
+bool isPushTime() {
+  time_t ts = time(nullptr);
+  if (ts < 1000000000UL) return false;
+  struct tm t;
+  gmtime_r(&ts, &t);
+  return (t.tm_hour > pushHour) || (t.tm_hour == pushHour && t.tm_min >= pushMin);
 }
 
 // ── Camera ────────────────────────────────────────────────────────────────────
@@ -186,12 +201,17 @@ bool fetchConfig() {
   previewPending = doc["previewRequested"] | false;
   qualityFromString(doc["quality"] | DEFAULT_QUALITY);
 
-  Serial.printf("[config] interval=%dmin capture=%s preview=%s\n",
-    intervalMin, captureEnabled ? "on" : "off", previewPending ? "YES" : "no");
+  // Parse "HH:MM" push time string from server
+  const char* pt = doc["pushTime"] | "02:00";
+  sscanf(pt, "%d:%d", &pushHour, &pushMin);
+
+  Serial.printf("[config] interval=%dmin push=%02d:%02d capture=%s preview=%s\n",
+    intervalMin, pushHour, pushMin,
+    captureEnabled ? "on" : "off", previewPending ? "YES" : "no");
   return true;
 }
 
-// Upload raw JPEG bytes directly to server. Returns true on success.
+// Upload raw JPEG bytes to server. Returns true on success.
 bool uploadPhoto(const char* date, uint32_t seq, const uint8_t* buf, size_t len) {
   char url[256];
   snprintf(url, sizeof(url), "%s/api/cameras/%s/upload?date=%s&seq=%04lu",
@@ -207,6 +227,7 @@ bool uploadPhoto(const char* date, uint32_t seq, const uint8_t* buf, size_t len)
   return code == 200 || code == 201;
 }
 
+// Capture a fresh frame and upload it as the live preview.
 void uploadPreview() {
   Serial.println("[preview] capturing snapshot");
   camera_fb_t* fb = esp_camera_fb_get();
@@ -223,33 +244,81 @@ void uploadPreview() {
   Serial.printf("[preview] → HTTP %d\n", code);
 }
 
-void reportStatus() {
+// Notify server that bulk push is complete so it can trigger stitching.
+void reportPushComplete(const char* date, int photoCount) {
   char url[192];
   snprintf(url, sizeof(url), "%s/api/cameras/%s/status", SERVER_URL, CAMERA_ID);
 
-  char ts[24];
-  time_t now = time(nullptr);
-  struct tm t; gmtime_r(&now, &t);
-  strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &t);
-
   JsonDocument doc;
-  doc["lastPhoto"]    = ts;
-  doc["photosToday"]  = (int)photoSeq;
+  JsonObject pc = doc["pushComplete"].to<JsonObject>();
+  pc["date"]       = date;
+  pc["photoCount"] = photoCount;
 
-  String body; serializeJson(doc, body);
+  String body;
+  serializeJson(doc, body);
   HTTPClient http;
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
-  http.setTimeout(10000);
-  http.POST(body);
+  http.setTimeout(15000);
+  int code = http.POST(body);
   http.end();
+  Serial.printf("[push] stitch trigger → HTTP %d\n", code);
+}
+
+// Read every JPEG in /{date}/ from SD and POST it to the server.
+void pushDayPhotos(const char* date) {
+  char dirPath[16];
+  snprintf(dirPath, sizeof(dirPath), "/%s", date);
+
+  File dir = SD_MMC.open(dirPath);
+  if (!dir || !dir.isDirectory()) {
+    Serial.printf("[push] no directory: %s\n", dirPath);
+    return;
+  }
+
+  Serial.printf("[push] starting upload for %s\n", date);
+  int uploaded = 0;
+  int failed   = 0;
+
+  File entry = dir.openNextFile();
+  while (entry) {
+    if (!entry.isDirectory()) {
+      const char* name = entry.name();          // e.g. "0001.jpg"
+      uint32_t    seq  = (uint32_t)strtoul(name, nullptr, 10);
+      size_t      len  = entry.size();
+
+      uint8_t* buf = psramFound()
+        ? (uint8_t*)ps_malloc(len)
+        : (uint8_t*)malloc(len);
+
+      if (buf) {
+        entry.read(buf, len);
+        if (uploadPhoto(date, seq, buf, len)) uploaded++;
+        else failed++;
+        free(buf);
+        delay(50);
+      } else {
+        Serial.printf("[push] malloc failed (%u bytes) for %s\n", (unsigned)len, name);
+        failed++;
+      }
+    }
+    entry.close();
+    entry = dir.openNextFile();
+  }
+  dir.close();
+
+  Serial.printf("[push] complete — %d uploaded, %d failed\n", uploaded, failed);
+
+  if (uploaded > 0 && WiFi.status() == WL_CONNECTED) {
+    reportPushComplete(date, uploaded);
+  }
 }
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n[boot] ESP-AL starting (always-on mode)");
+  Serial.println("\n[boot] ESP-AL starting (always-on, nightly push)");
 
   sdReady     = initSD();
   cameraReady = initCamera();
@@ -264,9 +333,9 @@ void setup() {
   // Capture immediately on first boot rather than waiting a full interval
   lastCaptureMs    = millis() - (uint32_t)intervalMin * 60000UL;
   lastConfigSyncMs = millis();
-  lastStatusMs     = millis();
 
-  Serial.printf("[boot] ready — capturing every %d min\n", intervalMin);
+  Serial.printf("[boot] ready — capturing every %d min, push at %02d:%02d UTC\n",
+    intervalMin, pushHour, pushMin);
 }
 
 // ── Loop ──────────────────────────────────────────────────────────────────────
@@ -279,7 +348,7 @@ void loop() {
     connectWiFi();
   }
 
-  // ── Config sync every CONFIG_SYNC_EVERY_N minutes ─────────────────────────
+  // ── Config sync every CONFIG_SYNC_EVERY_N intervals ──────────────────────
   uint32_t syncIntervalMs = (uint32_t)intervalMin * CONFIG_SYNC_EVERY_N * 60000UL;
   if (now - lastConfigSyncMs >= syncIntervalMs) {
     lastConfigSyncMs = now;
@@ -292,7 +361,7 @@ void loop() {
     }
   }
 
-  // ── Capture on interval ───────────────────────────────────────────────────
+  // ── Capture on interval — save to SD only ─────────────────────────────────
   uint32_t captureIntervalMs = (uint32_t)intervalMin * 60000UL;
   if (captureEnabled && (now - lastCaptureMs >= captureIntervalMs)) {
     lastCaptureMs = now;
@@ -312,27 +381,20 @@ void loop() {
     }
 
     camera_fb_t* fb = esp_camera_fb_get();
-    if (!fb) {
-      Serial.println("[cam] capture failed");
-      return;
-    }
+    if (!fb) { Serial.println("[cam] capture failed"); return; }
 
-    // Save to SD and upload using the same frame buffer
     saveToSD(currentDate, photoSeq, fb->buf, fb->len);
-
-    if (WiFi.status() == WL_CONNECTED) {
-      uploadPhoto(currentDate, photoSeq, fb->buf, fb->len);
-    } else {
-      Serial.println("[upload] skipped — no WiFi (saved to SD)");
-    }
-
     esp_camera_fb_return(fb);
   }
 
-  // ── Status report every 60 captures ──────────────────────────────────────
-  if (photoSeq > 0 && photoSeq % 60 == 0 && now - lastStatusMs > 60000UL) {
-    lastStatusMs = now;
-    if (WiFi.status() == WL_CONNECTED) reportStatus();
+  // ── Nightly push ──────────────────────────────────────────────────────────
+  if (sdReady && WiFi.status() == WL_CONNECTED) {
+    char today[11];
+    getDateStr(today);
+    if (isPushTime() && strcmp(today, lastPushDate) != 0) {
+      strncpy(lastPushDate, today, sizeof(lastPushDate));
+      pushDayPhotos(today);
+    }
   }
 
   delay(200);
