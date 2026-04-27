@@ -35,17 +35,18 @@ RTC_DATA_ATTR static int      cfgFrameSize    = FRAMESIZE_UXGA;
 RTC_DATA_ATTR static int      cfgJpegQuality  = 10;  // 0-63, lower = better
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+// All time operations use UTC to avoid localtime/timezone issues on ESP32.
 void getDateStr(char* buf, time_t t = 0) {
   if (t == 0) t = time(nullptr);
   struct tm tm_info;
-  localtime_r(&t, &tm_info);
+  gmtime_r(&t, &tm_info);
   strftime(buf, 11, "%Y-%m-%d", &tm_info);
 }
 
 time_t calcNextPushTime(int hour, int minute) {
   time_t now = time(nullptr);
   struct tm tm_info;
-  localtime_r(&now, &tm_info);
+  gmtime_r(&now, &tm_info);
   tm_info.tm_hour = hour;
   tm_info.tm_min  = minute;
   tm_info.tm_sec  = 0;
@@ -230,14 +231,25 @@ void disconnectWiFi() {
 }
 
 void syncNTP() {
-  configTime(TZ_OFFSET_S, DST_OFFSET_S, NTP_SERVER);
-  struct tm tm_info;
+  // Force UTC — avoids localtime_r producing garbage hours on ESP32-S3
+  setenv("TZ", "UTC0", 1);
+  tzset();
+  configTime(0, 0, NTP_SERVER);
+
+  // Wait for time to be set (up to 10s)
+  time_t now = 0;
   int attempts = 0;
-  while (!getLocalTime(&tm_info) && attempts++ < 20) delay(500);
-  if (attempts < 20) {
+  while (now < 1000000000UL && attempts++ < 20) {
+    delay(500);
+    now = time(nullptr);
+  }
+
+  if (now > 1000000000UL) {
     timeReady = true;
+    struct tm tm_info;
+    gmtime_r(&now, &tm_info);
     char buf[32];
-    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm_info);
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S UTC", &tm_info);
     Serial.printf("[ntp] time synced: %s\n", buf);
   } else {
     Serial.println("[ntp] sync failed");
@@ -469,6 +481,9 @@ void setup() {
   bootCount++;
   Serial.printf("\n[boot] #%lu\n", (unsigned long)bootCount);
 
+  // ── Mount SD once — used by both WiFi and capture paths ─────────────────
+  if (!initSD()) { goToSleep(60); }
+
   bool needWiFi = false;
 
   // ── First boot: must sync time and fetch initial config ──────────────────
@@ -496,11 +511,6 @@ void setup() {
 
   // ── Connect WiFi if needed ───────────────────────────────────────────────
   if (needWiFi) {
-    if (!initSD()) {
-      // Can't do much without SD; sleep and retry
-      goToSleep(60);
-    }
-
     if (!connectWiFi()) {
       // WiFi failed: capture anyway if possible, retry WiFi next cycle
       disconnectWiFi();
@@ -520,13 +530,11 @@ void setup() {
   // ── Recalculate push time if needed ─────────────────────────────────────
   if (timeReady && (nextPushTime == 0 || isPushTime)) {
     nextPushTime = calcNextPushTime(pushHour, pushMin);
-    Serial.printf("[boot] next push at %s\n",
-      []() {
-        static char buf[20];
-        struct tm t; localtime_r(&nextPushTime, &t);
-        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &t);
-        return buf;
-      }());
+    struct tm t;
+    gmtime_r(&nextPushTime, &t);
+    char pushBuf[20];
+    strftime(pushBuf, sizeof(pushBuf), "%Y-%m-%d %H:%M UTC", &t);
+    Serial.printf("[boot] next push at %s\n", pushBuf);
   }
 
   // ── Push cycle ───────────────────────────────────────────────────────────
@@ -551,8 +559,6 @@ void setup() {
 
   // ── Normal capture ───────────────────────────────────────────────────────
   if (captureEnabled) {
-    if (!initSD()) { goToSleep(60); }
-
     now = timeReady ? time(nullptr) : 0;
 
     // Update date tracking; reset counter if the date rolled over
